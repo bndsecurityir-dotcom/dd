@@ -1,0 +1,141 @@
+name: Ubuntu VLESS TCP Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================
+      # 1. Install Tailscale
+      # ==========================================
+      - name: Install Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          sudo systemctl enable --now tailscaled
+
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTHKEY" \
+            --hostname="github-vless-server"
+
+          sleep 5
+
+      # ==========================================
+      # 2. Install Xray
+      # ==========================================
+      - name: Install Xray
+        run: |
+          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+          sudo systemctl enable xray
+
+      # ==========================================
+      # 3. Generate UUID
+      # ==========================================
+      - name: Generate VLESS UUID
+        id: uuid
+        run: |
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
+
+      # ==========================================
+      # 4. Configure Xray VLESS TCP
+      # ==========================================
+      - name: Configure VLESS TCP
+        env:
+          UUID: ${{ steps.uuid.outputs.UUID }}
+        run: |
+          sudo mkdir -p /usr/local/etc/xray
+
+          sudo tee /usr/local/etc/xray/config.json > /dev/null <<EOF
+          {
+            "log": {
+              "loglevel": "warning"
+            },
+            "inbounds": [
+              {
+                "listen": "0.0.0.0",
+                "port": 8080,
+                "protocol": "vless",
+                "settings": {
+                  "clients": [
+                    {
+                      "id": "$UUID",
+                      "email": "github-vless"
+                    }
+                  ],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "none"
+                }
+              }
+            ],
+            "outbounds": [
+              {
+                "protocol": "freedom",
+                "settings": {}
+              }
+            ]
+          }
+          EOF
+
+          sudo xray -test \
+            -config /usr/local/etc/xray/config.json
+
+          sudo systemctl restart xray
+
+      # ==========================================
+      # 5. Open Port 8080
+      # ==========================================
+      - name: Open TCP 8080
+        run: |
+          sudo ufw allow 8080/tcp || true
+
+      # ==========================================
+      # 6. Display VLESS Configuration
+      # ==========================================
+      - name: Show VLESS Configuration
+        env:
+          UUID: ${{ steps.uuid.outputs.UUID }}
+        run: |
+          TS_IP=$(sudo tailscale ip -4)
+
+          echo ""
+          echo "===================================================="
+          echo "             VLESS TCP SERVER READY"
+          echo "===================================================="
+          echo ""
+          echo "Tailscale Address : $TS_IP"
+          echo "Port              : 8080"
+          echo "Protocol          : VLESS"
+          echo "Transport         : TCP"
+          echo "Security          : None"
+          echo "UUID              : $UUID"
+          echo ""
+          echo "VLESS CONFIG:"
+          echo ""
+          echo "vless://$UUID@$TS_IP:8080?type=tcp&security=none#GitHub-VLESS"
+          echo ""
+          echo "===================================================="
+          echo ""
+          echo "XRAY STATUS:"
+          sudo systemctl --no-pager status xray || true
+
+      # ==========================================
+      # 7. Keep Server Alive - 6 Hours
+      # ==========================================
+      - name: Keep Server Alive
+        run: |
+          for i in $(seq 1 360); do
+            sleep 60
+            echo "[$i/360] VLESS server running..."
+          done
