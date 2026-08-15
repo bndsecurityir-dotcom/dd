@@ -1,4 +1,4 @@
-name: Ubuntu VLESS TCP Server
+name: Ubuntu VLESS TCP Public
 
 on:
   workflow_dispatch:
@@ -11,44 +11,29 @@ jobs:
     steps:
 
       # ==========================================
-      # 1. Install Tailscale
-      # ==========================================
-      - name: Install Tailscale
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
-
-          sudo systemctl enable --now tailscaled
-
-          sudo tailscale up \
-            --authkey="$TAILSCALE_AUTHKEY" \
-            --hostname="github-vless-server"
-
-          sleep 5
-
-      # ==========================================
-      # 2. Install Xray
+      # 1. Install Xray
       # ==========================================
       - name: Install Xray
         run: |
-          bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+          sudo bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
           sudo systemctl enable xray
 
+          sudo xray version
+
       # ==========================================
-      # 3. Generate UUID
+      # 2. Generate UUID
       # ==========================================
-      - name: Generate VLESS UUID
+      - name: Generate UUID
         id: uuid
         run: |
           UUID=$(cat /proc/sys/kernel/random/uuid)
           echo "UUID=$UUID" >> "$GITHUB_OUTPUT"
 
       # ==========================================
-      # 4. Configure Xray VLESS TCP
+      # 3. Configure VLESS TCP
       # ==========================================
-      - name: Configure VLESS TCP
+      - name: Configure Xray VLESS TCP
         env:
           UUID: ${{ steps.uuid.outputs.UUID }}
         run: |
@@ -61,7 +46,7 @@ jobs:
             },
             "inbounds": [
               {
-                "listen": "0.0.0.0",
+                "listen": "127.0.0.1",
                 "port": 8080,
                 "protocol": "vless",
                 "settings": {
@@ -81,61 +66,111 @@ jobs:
             ],
             "outbounds": [
               {
-                "protocol": "freedom",
-                "settings": {}
+                "protocol": "freedom"
               }
             ]
           }
           EOF
 
-          sudo xray -test \
+          sudo xray run -test \
             -config /usr/local/etc/xray/config.json
 
           sudo systemctl restart xray
 
-      # ==========================================
-      # 5. Open Port 8080
-      # ==========================================
-      - name: Open TCP 8080
-        run: |
-          sudo ufw allow 8080/tcp || true
+          sleep 3
+
+          sudo systemctl --no-pager status xray
 
       # ==========================================
-      # 6. Display VLESS Configuration
+      # 4. Install ngrok
       # ==========================================
-      - name: Show VLESS Configuration
+      - name: Install ngrok
+        run: |
+          curl -sSL https://ngrok-agent.s3.amazonaws.com/ngrok.asc \
+            | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+
+          echo "deb https://ngrok-agent.s3.amazonaws.com bookworm main" \
+            | sudo tee /etc/apt/sources.list.d/ngrok.list
+
+          sudo apt-get update
+          sudo apt-get install -y ngrok
+
+          ngrok version
+
+      # ==========================================
+      # 5. Authenticate ngrok
+      # ==========================================
+      - name: Configure ngrok
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          ngrok config add-authtoken "$NGROK_AUTHTOKEN"
+
+      # ==========================================
+      # 6. Start Public TCP Tunnel
+      # ==========================================
+      - name: Start Public TCP Tunnel
         env:
           UUID: ${{ steps.uuid.outputs.UUID }}
         run: |
-          TS_IP=$(sudo tailscale ip -4)
+          nohup ngrok tcp 8080 > /tmp/ngrok.log 2>&1 &
+
+          sleep 8
+
+          echo ""
+          echo "=============================================="
+          echo "       NGROK PUBLIC TCP TUNNEL"
+          echo "=============================================="
+
+          cat /tmp/ngrok.log || true
+
+          echo ""
+          echo "=============================================="
+
+      # ==========================================
+      # 7. Get Public Address
+      # ==========================================
+      - name: Generate VLESS Config
+        env:
+          UUID: ${{ steps.uuid.outputs.UUID }}
+        run: |
+          sleep 3
+
+          NGROK_ADDR=$(curl -s http://127.0.0.1:4040/api/tunnels \
+            | python3 -c "
+          import sys,json
+          d=json.load(sys.stdin)
+          t=d['tunnels'][0]
+          print(t['public_url'].replace('tcp://',''))
+          ")
+
+          HOST=$(echo "$NGROK_ADDR" | cut -d: -f1)
+          PORT=$(echo "$NGROK_ADDR" | cut -d: -f2)
 
           echo ""
           echo "===================================================="
           echo "             VLESS TCP SERVER READY"
           echo "===================================================="
           echo ""
-          echo "Tailscale Address : $TS_IP"
-          echo "Port              : 8080"
-          echo "Protocol          : VLESS"
-          echo "Transport         : TCP"
-          echo "Security          : None"
-          echo "UUID              : $UUID"
+          echo "Public Host : $HOST"
+          echo "Public Port : $PORT"
+          echo "Protocol    : VLESS"
+          echo "Transport   : TCP"
+          echo "Security    : NONE"
+          echo "UUID        : $UUID"
           echo ""
           echo "VLESS CONFIG:"
           echo ""
-          echo "vless://$UUID@$TS_IP:8080?type=tcp&security=none#GitHub-VLESS"
+          echo "vless://$UUID@$HOST:$PORT?type=tcp&security=none#GitHub-VLESS"
           echo ""
           echo "===================================================="
-          echo ""
-          echo "XRAY STATUS:"
-          sudo systemctl --no-pager status xray || true
 
       # ==========================================
-      # 7. Keep Server Alive - 6 Hours
+      # 8. Keep Server Alive - 6 Hours
       # ==========================================
       - name: Keep Server Alive
         run: |
           for i in $(seq 1 360); do
             sleep 60
-            echo "[$i/360] VLESS server running..."
+            echo "[$i/360] VLESS server running... [$i/360]"
           done
